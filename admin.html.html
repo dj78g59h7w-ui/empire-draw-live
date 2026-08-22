@@ -37,7 +37,6 @@ body{display:flex;justify-content:center;align-items:flex-start}
  -webkit-appearance:none
 }
 #spin:disabled{cursor:default}
-#spin,#reset{display:none!important}
 #status{
  position:absolute;z-index:6;left:35%;top:64.9%;width:30%;
  text-align:center;color:#edca69;font:700 clamp(9px,1.3vw,16px) Georgia,serif;
@@ -81,7 +80,7 @@ body{display:flex;justify-content:center;align-items:flex-start}
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/12.2.1/firebase-app.js";
 import {
-  getFirestore, doc, onSnapshot
+  getFirestore, doc, onSnapshot, setDoc, runTransaction
 } from "https://www.gstatic.com/firebasejs/12.2.1/firebase-firestore.js";
 
 const firebaseConfig = {
@@ -98,15 +97,23 @@ const db = getFirestore(app);
 const drawRef = doc(db, "draws", "main");
 
 const groups = ["A","B","C","D"];
+const all = ["ROMAN","SAMURAI","EGYPTIAN","VIKING"];
+const SPIN_MS = 10000;
+
+const spin = document.getElementById("spin");
+const reset = document.getElementById("reset");
 const status = document.getElementById("status");
 const flash = document.getElementById("flash");
 const soundToggle = document.getElementById("soundToggle");
 
+let busy = false;
+let shared = { results:{}, current:0, complete:false, spinning:false };
 let currentPulse = null;
 let revealTimer = null;
+let finalizeTimer = null;
 let lastSpinToken = null;
 
-// ----- Sound -----
+// ----- Sound (no external audio file needed) -----
 let audioCtx = null;
 let soundEnabled = false;
 
@@ -188,7 +195,7 @@ soundToggle.addEventListener("click", ()=>{
   }
 });
 
-// ----- Synchronized visuals -----
+// ----- Visual animation -----
 function stopPulse(){
   if (currentPulse) {
     clearInterval(currentPulse);
@@ -203,7 +210,14 @@ function startPulse(){
   currentPulse = setInterval(()=>flash.classList.toggle("on"), 150);
 }
 
-function render(data){
+function clearTimers(){
+  if (revealTimer) clearTimeout(revealTimer);
+  if (finalizeTimer) clearTimeout(finalizeTimer);
+  revealTimer = null;
+  finalizeTimer = null;
+}
+
+function showBaseState(data){
   const results = data.results || {};
   groups.forEach(g => {
     document.getElementById("res"+g).textContent = results[g] || "";
@@ -214,47 +228,155 @@ function render(data){
 
   if (complete) {
     status.textContent = "DRAW COMPLETE";
-  } else if (!data.spinning) {
+    spin.style.display = "none";
+    reset.style.display = "block";
+  } else {
     status.textContent = "CURRENT GROUP: " + groups[current];
+    spin.style.display = "block";
+    reset.style.display = "none";
+    spin.disabled = busy || data.spinning === true;
   }
 }
 
-onSnapshot(drawRef, snap => {
-  if (!snap.exists()) {
-    status.textContent = "WAITING FOR DRAW";
-    return;
+function scheduleRevealAndFinalize(data){
+  clearTimers();
+  const revealAt = Number(data.revealAt || 0);
+  const delay = Math.max(0, revealAt - Date.now());
+  const group = groups[data.current] || groups[0];
+
+  status.textContent = "DRAWING FOR GROUP " + group + "...";
+  spin.disabled = true;
+  startPulse();
+
+  if (lastSpinToken !== data.spinToken) {
+    lastSpinToken = data.spinToken;
+    playSpinSound();
   }
 
-  const data = snap.data() || {};
-  render(data);
-
-  if (data.spinning === true && data.pendingResult && data.revealAt) {
-    const current = Number.isInteger(data.current) ? data.current : 0;
-    const group = groups[current] || "A";
-    status.textContent = "DRAWING FOR GROUP " + group + "...";
-    startPulse();
-
-    if (lastSpinToken !== data.spinToken) {
-      lastSpinToken = data.spinToken;
-      playSpinSound();
-    }
-
-    if (revealTimer) clearTimeout(revealTimer);
-    const delay = Math.max(0, Number(data.revealAt) - Date.now());
-    revealTimer = setTimeout(()=>{
-      stopPulse();
+  revealTimer = setTimeout(()=>{
+    stopPulse();
+    if (data.pendingResult && group) {
       document.getElementById("res"+group).textContent = data.pendingResult;
       status.textContent = "GROUP " + group + ": " + data.pendingResult;
       playRevealSound();
-    }, delay);
+    }
+  }, delay);
+
+  finalizeTimer = setTimeout(async ()=>{
+    try {
+      await runTransaction(db, async transaction => {
+        const snap = await transaction.get(drawRef);
+        if (!snap.exists()) return;
+        const d = snap.data();
+        if (!d.spinning || d.spinToken !== data.spinToken) return;
+
+        const idx = Number.isInteger(d.current) ? d.current : 0;
+        const g = groups[idx];
+        const results = { ...(d.results || {}) };
+        if (g && d.pendingResult) results[g] = d.pendingResult;
+        const next = idx + 1;
+
+        transaction.set(drawRef, {
+          results,
+          current: next,
+          complete: next >= groups.length,
+          spinning: false,
+          pendingResult: null,
+          revealAt: null,
+          spinToken: null
+        }, { merge: true });
+      });
+    } catch(e) {
+      console.error(e);
+    }
+  }, delay + 120);
+}
+
+onSnapshot(drawRef, async snap => {
+  if (!snap.exists()) {
+    try {
+      await setDoc(drawRef, {
+        results:{}, current:0, complete:false,
+        spinning:false, pendingResult:null, revealAt:null, spinToken:null
+      });
+    } catch(e) {
+      console.error(e);
+      status.textContent = "FIREBASE ERROR";
+    }
+    return;
+  }
+
+  shared = snap.data() || {};
+  showBaseState(shared);
+
+  if (shared.spinning === true && shared.pendingResult && shared.revealAt) {
+    scheduleRevealAndFinalize(shared);
   } else {
-    if (revealTimer) clearTimeout(revealTimer);
-    revealTimer = null;
+    clearTimers();
     stopPulse();
   }
 }, err => {
   console.error(err);
   status.textContent = "FIREBASE ERROR";
+});
+
+// Any device can start the spin. Firestore guarantees only one active spin.
+window.empireDraw = async function(){
+  if (busy) return;
+  busy = true;
+  spin.disabled = true;
+
+  try {
+    await runTransaction(db, async transaction => {
+      const snap = await transaction.get(drawRef);
+      const data = snap.exists()
+        ? snap.data()
+        : { results:{}, current:0, complete:false, spinning:false };
+
+      const idx = Number.isInteger(data.current) ? data.current : 0;
+      if (data.spinning || data.complete || idx >= groups.length) return;
+
+      const used = Object.values(data.results || {});
+      const remaining = all.filter(x => !used.includes(x));
+      if (!remaining.length) return;
+
+      const chosen = remaining[Math.floor(Math.random()*remaining.length)];
+      const token = Date.now().toString(36) + Math.random().toString(36).slice(2);
+
+      transaction.set(drawRef, {
+        spinning: true,
+        pendingResult: chosen,
+        revealAt: Date.now() + SPIN_MS,
+        spinToken: token
+      }, { merge: true });
+    });
+  } catch(e) {
+    console.error(e);
+    status.textContent = "FIREBASE ERROR";
+  } finally {
+    busy = false;
+  }
+};
+
+reset.addEventListener("click", async function(){
+  if (busy) return;
+  busy = true;
+  reset.disabled = true;
+  clearTimers();
+  stopPulse();
+
+  try {
+    await setDoc(drawRef, {
+      results:{}, current:0, complete:false,
+      spinning:false, pendingResult:null, revealAt:null, spinToken:null
+    });
+  } catch(e) {
+    console.error(e);
+    status.textContent = "FIREBASE ERROR";
+  } finally {
+    busy = false;
+    reset.disabled = false;
+  }
 });
 </script>
 </body></html>
