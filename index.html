@@ -81,212 +81,245 @@ body{display:flex;justify-content:center;align-items:flex-start}
 <button id="spin" type="button" aria-label="Spin the wheel" onclick="window.empireDraw(); return false;"></button>
 <button id="reset">RESET DRAW</button>
 </div>
-<script type="module">
-import { initializeApp } from "https://www.gstatic.com/firebasejs/12.2.1/firebase-app.js";
-import {
-  getFirestore, doc, onSnapshot, getDoc
-} from "https://www.gstatic.com/firebasejs/12.2.1/firebase-firestore.js";
+<script>
+(function(){
+  const PROJECT_ID = "whatsapp-lottery-21bca";
+  const API_KEY = "AIzaSyAN3230EyoVm5zGnDh1yT-V20okVL0YibQ";
+  const DOC_URL =
+    "https://firestore.googleapis.com/v1/projects/" +
+    PROJECT_ID +
+    "/databases/(default)/documents/draws/main?key=" +
+    API_KEY;
 
-const firebaseConfig = {
-  apiKey: "AIzaSyAN3230EyoVm5zGnDh1yT-V20okVL0YibQ",
-  authDomain: "whatsapp-lottery-21bca.firebaseapp.com",
-  projectId: "whatsapp-lottery-21bca",
-  storageBucket: "whatsapp-lottery-21bca.firebasestorage.app",
-  messagingSenderId: "971417133918",
-  appId: "1:971417133918:web:a8e99f15c5e813b54465cf"
-};
+  const groups = ["A","B","C","D"];
+  const status = document.getElementById("status");
+  const flash = document.getElementById("flash");
+  const soundToggle = document.getElementById("soundToggle");
 
-const app = initializeApp(firebaseConfig);
-const db = getFirestore(app);
-const drawRef = doc(db, "draws", "main");
+  let currentPulse = null;
+  let revealTimer = null;
+  let lastSpinToken = null;
+  let lastStateSignature = "";
+  let pollBusy = false;
 
-const groups = ["A","B","C","D"];
-const status = document.getElementById("status");
-const flash = document.getElementById("flash");
-const soundToggle = document.getElementById("soundToggle");
+  // ----- Sound -----
+  let audioCtx = null;
+  let soundEnabled = false;
 
-let currentPulse = null;
-let revealTimer = null;
-let lastSpinToken = null;
-
-// ----- Sound -----
-let audioCtx = null;
-let soundEnabled = false;
-
-function ensureAudio(){
-  if (!audioCtx) {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  }
-  if (audioCtx.state === "suspended") audioCtx.resume();
-}
-
-function tone(freq, when, duration, gain=0.035, type="sine"){
-  if (!soundEnabled || !audioCtx) return;
-  const osc = audioCtx.createOscillator();
-  const g = audioCtx.createGain();
-  osc.type = type;
-  osc.frequency.setValueAtTime(freq, when);
-  g.gain.setValueAtTime(0.0001, when);
-  g.gain.exponentialRampToValueAtTime(gain, when + 0.02);
-  g.gain.exponentialRampToValueAtTime(0.0001, when + duration);
-  osc.connect(g).connect(audioCtx.destination);
-  osc.start(when);
-  osc.stop(when + duration + 0.05);
-}
-
-function playSpinSound(){
-  if (!soundEnabled) return;
-  ensureAudio();
-
-  const t = audioCtx.currentTime + 0.04;
-
-  // Original dark-epic build: low drones, war-drum pulses, then rising tension.
-  [82.41, 98.00, 110.00].forEach((f,i)=>{
-    tone(f, t + i*0.55, 1.4, 0.026, "sawtooth");
-  });
-
-  // Slow drum-like pulses for the first half.
-  for (let i=0;i<8;i++){
-    const when = t + i*0.82;
-    tone(72 + (i%2)*10, when, 0.20, 0.05, "square");
-    tone(145, when+0.02, 0.12, 0.018, "triangle");
+  function ensureAudio(){
+    try{
+      if (!audioCtx) {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return;
+        audioCtx = new Ctx();
+      }
+      if (audioCtx.state === "suspended") audioCtx.resume();
+    }catch(e){}
   }
 
-  // Rising orchestral-style tension.
-  const rise = [146.83,164.81,196.00,220.00,246.94,293.66,329.63,392.00,440.00,523.25];
-  rise.forEach((f,i)=>{
-    tone(f, t + 4.8 + i*0.42, 0.34, 0.032 + i*0.0015, i%3===0 ? "sawtooth" : "triangle");
-  });
-
-  // Faster final countdown pulses.
-  for (let i=0;i<10;i++){
-    const when = t + 7.25 + i*0.24;
-    tone(110 + i*11, when, 0.14, 0.038, "square");
+  function tone(freq, when, duration, gain, type){
+    if (!soundEnabled || !audioCtx) return;
+    gain = gain || 0.035;
+    type = type || "sine";
+    const osc = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, when);
+    g.gain.setValueAtTime(0.0001, when);
+    g.gain.exponentialRampToValueAtTime(gain, when + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, when + duration);
+    osc.connect(g);
+    g.connect(audioCtx.destination);
+    osc.start(when);
+    osc.stop(when + duration + 0.05);
   }
-}
 
-function playRevealSound(){
-  if (!soundEnabled) return;
-  ensureAudio();
+  function playSpinSound(){
+    if (!soundEnabled) return;
+    ensureAudio();
+    if (!audioCtx) return;
+    const t = audioCtx.currentTime + 0.04;
 
-  const t = audioCtx.currentTime + 0.02;
+    [82.41, 98.00, 110.00].forEach(function(f,i){
+      tone(f, t + i*0.55, 1.4, 0.026, "sawtooth");
+    });
 
-  // Original triumphant reveal chord.
-  tone(130.81, t,       0.75, 0.055, "sawtooth");
-  tone(261.63, t+0.02,  0.72, 0.048, "triangle");
-  tone(392.00, t+0.08,  0.68, 0.048, "triangle");
-  tone(523.25, t+0.18,  0.55, 0.052, "triangle");
-  tone(783.99, t+0.32,  0.60, 0.040, "sine");
-}
-
-soundToggle.addEventListener("click", ()=>{
-  ensureAudio();
-  soundEnabled = !soundEnabled;
-  soundToggle.textContent = soundEnabled ? "🔊 SOUND ON" : "🔇 SOUND OFF";
-  soundToggle.classList.toggle("on", soundEnabled);
-  if (soundEnabled) {
-    const t = audioCtx.currentTime + 0.01;
-    tone(660, t, 0.12, 0.035, "triangle");
-    tone(880, t+0.10, 0.16, 0.035, "triangle");
-  }
-});
-
-// ----- Synchronized visuals -----
-function stopPulse(){
-  if (currentPulse) {
-    clearInterval(currentPulse);
-    currentPulse = null;
-  }
-  flash.classList.remove("on");
-}
-
-function startPulse(){
-  stopPulse();
-  flash.classList.add("on");
-  currentPulse = setInterval(()=>flash.classList.toggle("on"), 150);
-}
-
-function render(data){
-  const results = data.results || {};
-  groups.forEach(g => {
-    document.getElementById("res"+g).textContent = results[g] || "";
-  });
-
-  const current = Number.isInteger(data.current) ? data.current : 0;
-  const complete = data.complete === true || current >= groups.length;
-
-  if (complete) {
-    status.textContent = "DRAW COMPLETE";
-  } else if (!data.spinning) {
-    status.textContent = "CURRENT GROUP: " + groups[current];
-  }
-}
-
-function applySnapshotData(data){
-  render(data);
-
-  if (data.spinning === true && data.pendingResult && data.revealAt) {
-    const current = Number.isInteger(data.current) ? data.current : 0;
-    const group = groups[current] || "A";
-    status.textContent = "DRAWING FOR GROUP " + group + "...";
-    startPulse();
-
-    if (lastSpinToken !== data.spinToken) {
-      lastSpinToken = data.spinToken;
-      playSpinSound();
+    for (let i=0;i<8;i++){
+      const when = t + i*0.82;
+      tone(72 + (i%2)*10, when, 0.20, 0.05, "square");
+      tone(145, when+0.02, 0.12, 0.018, "triangle");
     }
 
-    if (revealTimer) clearTimeout(revealTimer);
-    const delay = Math.max(0, Number(data.revealAt) - Date.now());
-    revealTimer = setTimeout(()=>{
-      stopPulse();
-      document.getElementById("res"+group).textContent = data.pendingResult;
-      status.textContent = "GROUP " + group + ": " + data.pendingResult;
-      playRevealSound();
-    }, delay);
-  } else {
-    if (revealTimer) clearTimeout(revealTimer);
-    revealTimer = null;
+    const rise = [146.83,164.81,196.00,220.00,246.94,293.66,329.63,392.00,440.00,523.25];
+    rise.forEach(function(f,i){
+      tone(f, t + 4.8 + i*0.42, 0.34, 0.032 + i*0.0015, i%3===0 ? "sawtooth" : "triangle");
+    });
+
+    for (let i=0;i<10;i++){
+      const when = t + 7.25 + i*0.24;
+      tone(110 + i*11, when, 0.14, 0.038, "square");
+    }
+  }
+
+  function playRevealSound(){
+    if (!soundEnabled) return;
+    ensureAudio();
+    if (!audioCtx) return;
+    const t = audioCtx.currentTime + 0.02;
+    tone(130.81, t,       0.75, 0.055, "sawtooth");
+    tone(261.63, t+0.02,  0.72, 0.048, "triangle");
+    tone(392.00, t+0.08,  0.68, 0.048, "triangle");
+    tone(523.25, t+0.18,  0.55, 0.052, "triangle");
+    tone(783.99, t+0.32,  0.60, 0.040, "sine");
+  }
+
+  if (soundToggle) {
+    soundToggle.addEventListener("click", function(){
+      ensureAudio();
+      soundEnabled = !soundEnabled;
+      soundToggle.textContent = soundEnabled ? "🔊 SOUND ON" : "🔇 SOUND OFF";
+      if (soundToggle.classList) {
+        if (soundEnabled) soundToggle.classList.add("on");
+        else soundToggle.classList.remove("on");
+      }
+      if (soundEnabled && audioCtx) {
+        const t = audioCtx.currentTime + 0.01;
+        tone(660, t, 0.12, 0.035, "triangle");
+        tone(880, t+0.10, 0.16, 0.035, "triangle");
+      }
+    });
+  }
+
+  // ----- Visuals -----
+  function stopPulse(){
+    if (currentPulse) {
+      clearInterval(currentPulse);
+      currentPulse = null;
+    }
+    flash.classList.remove("on");
+  }
+
+  function startPulse(){
     stopPulse();
+    flash.classList.add("on");
+    currentPulse = setInterval(function(){
+      flash.classList.toggle("on");
+    }, 150);
   }
-}
 
-onSnapshot(drawRef, snap => {
-  if (!snap.exists()) {
-    status.textContent = "WAITING FOR DRAW";
-    return;
+  function fromValue(v){
+    if (!v) return null;
+    if (Object.prototype.hasOwnProperty.call(v, "stringValue")) return v.stringValue;
+    if (Object.prototype.hasOwnProperty.call(v, "booleanValue")) return v.booleanValue;
+    if (Object.prototype.hasOwnProperty.call(v, "integerValue")) return Number(v.integerValue);
+    if (Object.prototype.hasOwnProperty.call(v, "doubleValue")) return Number(v.doubleValue);
+    if (Object.prototype.hasOwnProperty.call(v, "timestampValue")) return Date.parse(v.timestampValue);
+    if (v.mapValue) {
+      const out = {};
+      const f = (v.mapValue && v.mapValue.fields) || {};
+      Object.keys(f).forEach(function(k){ out[k] = fromValue(f[k]); });
+      return out;
+    }
+    return null;
   }
-  applySnapshotData(snap.data() || {});
-}, err => {
-  console.error("Live listener error:", err);
-  status.textContent = "RECONNECTING...";
-});
 
-// Safari/iPhone fallback:
-// Some iOS in-app browsers can pause the live Firestore listener.
-// Polling keeps the public display synchronized even if that happens.
-async function refreshFromFirestore(){
-  try {
-    const snap = await getDoc(drawRef);
-    if (snap.exists()) applySnapshotData(snap.data() || {});
-  } catch (e) {
-    console.error("Refresh error:", e);
+  function decodeDocument(json){
+    const data = {};
+    const f = (json && json.fields) || {};
+    Object.keys(f).forEach(function(k){ data[k] = fromValue(f[k]); });
+    return data;
   }
-}
 
-// Poll every 2 seconds as a fallback for iPhone/Safari.
-setInterval(refreshFromFirestore, 2000);
+  function renderBase(data){
+    const results = data.results || {};
+    groups.forEach(function(g){
+      const el = document.getElementById("res"+g);
+      if (el) el.textContent = results[g] || "";
+    });
 
-// Refresh immediately when Safari returns from background,
-// back/forward cache, screen lock, or an in-app browser resumes.
-window.addEventListener("pageshow", refreshFromFirestore);
-window.addEventListener("focus", refreshFromFirestore);
-document.addEventListener("visibilitychange", ()=>{
-  if (document.visibilityState === "visible") refreshFromFirestore();
-});
+    const current = Number.isInteger(data.current) ? data.current : 0;
+    const complete = data.complete === true || current >= groups.length;
 
-// One extra refresh shortly after load for slow mobile connections.
-setTimeout(refreshFromFirestore, 700);
-setTimeout(refreshFromFirestore, 2200);
+    if (complete) {
+      status.textContent = "DRAW COMPLETE";
+    } else if (!data.spinning) {
+      status.textContent = "CURRENT GROUP: " + groups[current];
+    }
+  }
+
+  function applyState(data){
+    renderBase(data);
+
+    if (data.spinning === true && data.pendingResult && data.revealAt) {
+      const current = Number.isInteger(data.current) ? data.current : 0;
+      const group = groups[current] || "A";
+      status.textContent = "DRAWING FOR GROUP " + group + "...";
+      startPulse();
+
+      if (lastSpinToken !== data.spinToken) {
+        lastSpinToken = data.spinToken;
+        playSpinSound();
+      }
+
+      if (revealTimer) clearTimeout(revealTimer);
+      const delay = Math.max(0, Number(data.revealAt) - Date.now());
+      revealTimer = setTimeout(function(){
+        stopPulse();
+        const el = document.getElementById("res"+group);
+        if (el) el.textContent = data.pendingResult;
+        status.textContent = "GROUP " + group + ": " + data.pendingResult;
+        playRevealSound();
+      }, delay);
+    } else {
+      if (revealTimer) clearTimeout(revealTimer);
+      revealTimer = null;
+      stopPulse();
+    }
+  }
+
+  async function poll(){
+    if (pollBusy) return;
+    pollBusy = true;
+    try{
+      const url = DOC_URL + "&_=" + Date.now();
+      const r = await fetch(url, {
+        method: "GET",
+        cache: "no-store",
+        headers: {
+          "Cache-Control": "no-cache",
+          "Pragma": "no-cache"
+        }
+      });
+
+      if (!r.ok) {
+        throw new Error("HTTP " + r.status);
+      }
+
+      const json = await r.json();
+      const data = decodeDocument(json);
+      const sig = JSON.stringify(data);
+
+      if (sig !== lastStateSignature) {
+        lastStateSignature = sig;
+        applyState(data);
+      }
+    }catch(e){
+      console.error("Polling error:", e);
+      status.textContent = "RECONNECTING...";
+    }finally{
+      pollBusy = false;
+    }
+  }
+
+  // iPhone/Safari-safe polling. No realtime socket required.
+  poll();
+  setInterval(poll, 1000);
+
+  window.addEventListener("pageshow", poll);
+  window.addEventListener("focus", poll);
+  document.addEventListener("visibilitychange", function(){
+    if (document.visibilityState === "visible") poll();
+  });
+})();
 </script>
 </body></html>
