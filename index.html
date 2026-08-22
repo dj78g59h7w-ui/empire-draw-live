@@ -66,68 +66,134 @@ body{display:flex;justify-content:center;align-items:flex-start}
 <button id="spin" type="button" aria-label="Spin the wheel" onclick="window.empireDraw(); return false;"></button>
 <button id="reset">RESET DRAW</button>
 </div>
-<script>
-(function(){
- var groups=["A","B","C","D"];
- var all=["ROMAN","SAMURAI","EGYPTIAN","VIKING"];
- var remaining=all.slice(),current=0,busy=false;
- var spin=document.getElementById("spin"),reset=document.getElementById("reset"),
- status=document.getElementById("status"),flash=document.getElementById("flash");
-
- window.empireDraw = function(){
-   if(busy||current>=4)return;
-   busy=true;spin.disabled=true;
-   var g=groups[current];
-   status.textContent="DRAWING FOR GROUP "+g+"...";
-   var pulse=setInterval(function(){flash.classList.toggle("on")},180);
-   setTimeout(function(){
-     clearInterval(pulse);flash.classList.remove("on");
-     var i=Math.floor(Math.random()*remaining.length);
-     var chosen=remaining.splice(i,1)[0];
-     document.getElementById("res"+g).textContent=chosen;
-     status.textContent="GROUP "+g+": "+chosen;
-     current++;
-     if(current<4){
-       setTimeout(function(){
-         status.textContent="CURRENT GROUP: "+groups[current];
-         spin.disabled=false;busy=false;
-       },700);
-     }else{
-       status.textContent="DRAW COMPLETE";
-       spin.style.display="none";reset.style.display="block";busy=false;
-     }
-   },2500);
- }
- function restart(){
-   remaining=all.slice();current=0;busy=false;
-   groups.forEach(function(g){document.getElementById("res"+g).textContent=""});
-   status.textContent="CURRENT GROUP: A";
-   spin.style.display="block";spin.disabled=false;reset.style.display="none";
- }
- reset.addEventListener("click",restart);
-})();
-</script>
 <script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.2.1/firebase-app.js";
+import {
+  getFirestore, doc, onSnapshot, setDoc, runTransaction
+} from "https://www.gstatic.com/firebasejs/12.2.1/firebase-firestore.js";
 
-  import { initializeApp } from "https://www.gstatic.com/firebasejs/12.2.1/firebase-app.js";
+const firebaseConfig = {
+  apiKey: "AIzaSyAN3230EyoVm5zGnDh1yT-V20okVL0YibQ",
+  authDomain: "whatsapp-lottery-21bca.firebaseapp.com",
+  projectId: "whatsapp-lottery-21bca",
+  storageBucket: "whatsapp-lottery-21bca.firebasestorage.app",
+  messagingSenderId: "971417133918",
+  appId: "1:971417133918:web:a8e99f15c5e813b54465cf"
+};
 
-  const firebaseConfig = {
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const drawRef = doc(db, "draws", "main");
 
-    apiKey: "AIzaSyAN3230EyoVm5zGnDh1yT-V20okVL0YibQ",
+const groups = ["A","B","C","D"];
+const all = ["ROMAN","SAMURAI","EGYPTIAN","VIKING"];
+const spin = document.getElementById("spin");
+const reset = document.getElementById("reset");
+const status = document.getElementById("status");
+const flash = document.getElementById("flash");
+let busy = false;
+let shared = { results:{}, current:0, complete:false };
 
-    authDomain: "whatsapp-lottery-21bca.firebaseapp.com",
+function render(data){
+  shared = data || { results:{}, current:0, complete:false };
+  const results = shared.results || {};
+  groups.forEach(g => {
+    document.getElementById("res"+g).textContent = results[g] || "";
+  });
 
-    projectId: "whatsapp-lottery-21bca",
+  const current = Number.isInteger(shared.current) ? shared.current : 0;
+  const complete = shared.complete === true || current >= groups.length;
 
-    storageBucket: "whatsapp-lottery-21bca.firebasestorage.app",
+  if (complete) {
+    status.textContent = "DRAW COMPLETE";
+    spin.style.display = "none";
+    reset.style.display = "block";
+  } else {
+    status.textContent = "CURRENT GROUP: " + groups[current];
+    spin.style.display = "block";
+    reset.style.display = "none";
+    spin.disabled = busy;
+  }
+}
 
-    messagingSenderId: "971417133918",
+onSnapshot(drawRef, async snap => {
+  if (!snap.exists()) {
+    try {
+      await setDoc(drawRef, { results:{}, current:0, complete:false });
+    } catch(e) {
+      console.error(e);
+      status.textContent = "FIREBASE ERROR";
+    }
+    return;
+  }
+  render(snap.data());
+}, err => {
+  console.error(err);
+  status.textContent = "FIREBASE ERROR";
+});
 
-    appId: "1:971417133918:web:a8e99f15c5e813b54465cf"
+window.empireDraw = async function(){
+  if (busy) return;
+  busy = true;
+  spin.disabled = true;
 
-  };
+  const current = Number.isInteger(shared.current) ? shared.current : 0;
+  if (shared.complete || current >= groups.length) {
+    busy = false;
+    return;
+  }
 
-  const app = initializeApp(firebaseConfig);
+  status.textContent = "DRAWING FOR GROUP " + groups[current] + "...";
+  const pulse = setInterval(() => flash.classList.toggle("on"), 180);
 
+  try {
+    await new Promise(resolve => setTimeout(resolve, 2500));
+
+    await runTransaction(db, async transaction => {
+      const snap = await transaction.get(drawRef);
+      const data = snap.exists() ? snap.data() : { results:{}, current:0, complete:false };
+      const idx = Number.isInteger(data.current) ? data.current : 0;
+      if (data.complete || idx >= groups.length) return;
+
+      const results = data.results || {};
+      const used = Object.values(results);
+      const remaining = all.filter(x => !used.includes(x));
+      if (!remaining.length) return;
+
+      const chosen = remaining[Math.floor(Math.random()*remaining.length)];
+      const nextResults = { ...results, [groups[idx]]: chosen };
+      const next = idx + 1;
+
+      transaction.set(drawRef, {
+        results: nextResults,
+        current: next,
+        complete: next >= groups.length
+      });
+    });
+  } catch(e) {
+    console.error(e);
+    status.textContent = "FIREBASE ERROR";
+  } finally {
+    clearInterval(pulse);
+    flash.classList.remove("on");
+    busy = false;
+    spin.disabled = false;
+  }
+};
+
+reset.addEventListener("click", async function(){
+  if (busy) return;
+  busy = true;
+  reset.disabled = true;
+  try {
+    await setDoc(drawRef, { results:{}, current:0, complete:false });
+  } catch(e) {
+    console.error(e);
+    status.textContent = "FIREBASE ERROR";
+  } finally {
+    busy = false;
+    reset.disabled = false;
+  }
+});
 </script>
 </body></html>
